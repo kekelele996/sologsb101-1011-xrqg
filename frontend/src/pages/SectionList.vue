@@ -14,13 +14,16 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
-import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
+import { useReconcileStore } from '@/stores/reconcileStore'
+import { calcSectionDischarge, calcMeanVelocity } from '@/utils/flow'
+import { MEASURE_METHODS, REF_STATUS_TONE, type MeasureMethod, type Section } from '@/types/section'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const reconcileStore = useReconcileStore()
 
 const stationId = computed(() => String(route.params.id ?? ''))
 const station = computed(() => stationStore.stationById(stationId.value))
@@ -73,6 +76,58 @@ const stats = computed(() => {
   }
 })
 
+/** 取测次对账视图（编号状态 / 说明） */
+function refViewOf(section: Section) {
+  return reconcileStore.sectionViews.find((view) => view.section.id === section.id) ?? null
+}
+
+/** 实时计算某测次断面流量（垂线部分面积法），供「报流量」使用 */
+function liveDischargeOf(section: Section): number {
+  const verticals = sectionStore.verticalsOfSection(section.id)
+  const slices = verticals.map((vertical) => {
+    const points = sectionStore.pointsOfVertical(vertical.id)
+    return {
+      id: vertical.id,
+      no: vertical.no,
+      startDistanceM: vertical.startDistanceM,
+      depthM: vertical.depthM,
+      meanVelocityMs: calcMeanVelocity(
+        points.map((point) => ({ velocityMs: point.velocityMs, weight: point.weight }))
+      )
+    }
+  })
+  return calcSectionDischarge(slices).flowM3s
+}
+
+/** 悬空 / 待认领测次数（含提示条统计） */
+const heldCount = computed(
+  () => sectionRows.value.filter((section) => section.refStatus !== '对账中').length
+)
+
+async function reportSectionFlow(section: Section): Promise<void> {
+  if (section.refStatus !== '对账中') {
+    ElMessage.warning('编号已撤或并走，该测次先搁着，这期间流量先不报')
+    return
+  }
+  const flowM3s = liveDischargeOf(section)
+  if (!(flowM3s > 0)) {
+    ElMessage.warning('该测次尚无有效垂线测点，算不出断面流量')
+    return
+  }
+  const accepted = await reconcileStore.reportFlow(section.id, flowM3s)
+  if (accepted) ElMessage.success(`流量 ${flowM3s.toFixed(2)} m³/s 已按编号 ${section.refCode} 报出`)
+  else ElMessage.error('报量失败：编号对账状态已变化，请刷新后重试')
+}
+
+function gotoReconcile(section?: Section): void {
+  void router.push({ path: '/reconcile', query: section ? { focus: section.id } : {} })
+}
+
+/** 悬空 / 待认领测次整行置灰，提示先搁着 */
+function sectionRowClass({ row }: { row: Section }): string {
+  return row.refStatus === '对账中' ? '' : 'gb-row-held'
+}
+
 function openCreate(): void {
   editingId.value = null
   form.measureNo = `${new Date().getFullYear()}-${String(new Date().getMonth() + 1).padStart(2, '0')}-${String(
@@ -113,20 +168,39 @@ async function submitForm(): Promise<void> {
     return
   }
   submitting.value = true
+  const owner = station.value
+  if (!owner) {
+    ElMessage.warning('测站不存在，无法落测次')
+    submitting.value = false
+    return
+  }
+  const payload = {
+    stationId: stationId.value,
+    measureNo: form.measureNo.trim(),
+    startDistanceM: form.startDistanceM,
+    stageM: form.stageM,
+    method: form.method,
+    measuredAt: new Date(form.measuredAt).toISOString()
+  }
   try {
-    const payload = {
-      stationId: stationId.value,
-      measureNo: form.measureNo.trim(),
-      startDistanceM: form.startDistanceM,
-      stageM: form.stageM,
-      method: form.method,
-      measuredAt: new Date(form.measuredAt).toISOString()
-    }
     if (editingId.value) {
       await sectionStore.updateSection(editingId.value, payload)
       ElMessage.success('测次已更新')
     } else {
-      const created = await sectionStore.createSection(payload)
+      // 落测次即引用站网科当前编号 + 版本；编号已撤/并走时新测次置悬空、暂停报量
+      const created = await sectionStore.createSection({
+        ...payload,
+        refCode: owner.sectionCode,
+        refVersion: owner.codeVersion,
+        refStatus: owner.lifecycle === '现行' ? '对账中' : '悬空',
+        refNote:
+          owner.lifecycle === '现行'
+            ? `落测次引用编号 ${owner.sectionCode} v${owner.codeVersion}`
+            : `落测次时编号 ${owner.sectionCode} 已${owner.lifecycle === '已撤' ? '撤' : '并走'}，等重新指派`,
+        reported: false,
+        reportedFlowM3s: null,
+        reportedAt: null
+      })
       sectionStore.selectSection(created.id)
       ElMessage.success(`测次已新增，当前水位 ${created.stageM.toFixed(2)} m`)
     }
@@ -176,6 +250,7 @@ function reseedIfEmpty(): void {
 
 onMounted(() => {
   reseedIfEmpty()
+  reconcileStore.start()
   const query = route.query
   sectionStore.patchFilter({
     keyword: typeof query.kw === 'string' ? query.kw : '',
@@ -216,11 +291,19 @@ onMounted(() => {
           </el-breadcrumb>
           <h2 class="page__title">
             {{ station.name }} · 断面测次
-            <el-tag size="small" effect="plain" class="page__tag">{{ station.sectionCode }}</el-tag>
+            <el-tag size="small" effect="plain" class="page__tag">{{ station.sectionCode }} v{{ station.codeVersion }}</el-tag>
+            <el-tag
+              size="small"
+              :type="station.lifecycle === '现行' ? 'success' : station.lifecycle === '已撤' ? 'danger' : 'warning'"
+              effect="plain"
+            >
+              编号{{ station.lifecycle }}
+            </el-tag>
             <el-tag size="small" type="info" effect="plain">{{ station.river }}</el-tag>
           </h2>
           <p class="gb-hint">
-            集水面积 {{ station.catchmentKm2 }} km²。每次测流记录测次号、起点距、水位与测法，随后布设垂线并录流速测点。
+            集水面积 {{ station.catchmentKm2 }} km²。河名、集水面积与断面编号归站网科定；巡测队按「编号 + 版本」落测次。
+            编号撤号 / 并号期间，相关测次先搁着、流量先不报，到编号对账台等重新指派。
           </p>
         </div>
         <el-button type="primary" :icon="Plus" @click="openCreate">新增测次</el-button>
@@ -244,6 +327,19 @@ onMounted(() => {
         />
         <StatBadge label="垂线合计" :value="stats.verticalCount" suffix="条" tone="success" icon="Histogram" />
       </div>
+
+      <el-alert
+        v-if="heldCount > 0"
+        type="warning"
+        show-icon
+        :closable="false"
+        class="page__held-alert"
+        title="该站有测次的编号已撤或并走（或旧编号待认领）：测次先搁着，这期间流量先不报，先前报出去的按当时编号仍可查。"
+      >
+        <div class="page__held-actions">
+          <el-button size="small" type="primary" @click="gotoReconcile()">前往编号对账台</el-button>
+        </div>
+      </el-alert>
 
       <FilterBar
         :model-value="filterModel"
@@ -272,40 +368,80 @@ onMounted(() => {
         @secondary="handleReset"
       />
 
-      <el-table v-else :data="sectionRows" border stripe class="gb-table-compact">
+      <el-table v-else :data="sectionRows" border stripe class="gb-table-compact" :row-class-name="sectionRowClass">
         <el-table-column prop="measureNo" label="测次号" min-width="150" />
-        <el-table-column label="测法" width="110">
+        <el-table-column label="引用编号" min-width="150">
+          <template #default="{ row }">
+            <div class="page__ref-cell">
+              <span class="gb-mono">{{ row.refCode || '—' }}</span>
+              <el-tag size="small" :type="REF_STATUS_TONE[row.refStatus as keyof typeof REF_STATUS_TONE]" effect="plain">
+                {{ row.refStatus }}
+              </el-tag>
+            </div>
+            <span v-if="refViewOf(row)?.statusText" class="page__ref-note">{{ refViewOf(row)?.statusText }}</span>
+          </template>
+        </el-table-column>
+        <el-table-column label="测法" width="100">
           <template #default="{ row }">
             <el-tag size="small" :type="row.method === 'ADCP' ? 'success' : row.method === '浮标' ? 'warning' : 'primary'" effect="plain">
               {{ row.method }}
             </el-tag>
           </template>
         </el-table-column>
-        <el-table-column label="水位 (m)" width="110" align="right">
+        <el-table-column label="水位 (m)" width="100" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.stageM.toFixed(2) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="起点距 (m)" width="120" align="right">
+        <el-table-column label="起点距 (m)" width="110" align="right">
           <template #default="{ row }">
             <span class="gb-mono">{{ row.startDistanceM.toFixed(1) }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="垂线条数" width="110" align="center">
+        <el-table-column label="流量上报" width="170">
+          <template #default="{ row }">
+            <el-tag v-if="row.reported" size="small" type="success" effect="plain">
+              已报 {{ row.reportedFlowM3s?.toFixed(1) }} m³/s
+            </el-tag>
+            <el-tag v-else-if="row.refStatus === '对账中'" size="small" type="info" effect="plain">未报</el-tag>
+            <el-tooltip v-else content="编号撤并 / 待认领期间流量先不报" placement="top">
+              <el-tag size="small" type="warning" effect="plain">暂停报量</el-tag>
+            </el-tooltip>
+          </template>
+        </el-table-column>
+        <el-table-column label="垂线条数" width="100" align="center">
           <template #default="{ row }">
             <el-button text type="primary" size="small" @click="gotoVerticals(row)">
               {{ sectionStore.sectionVerticalCounts[row.id] ?? 0 }} 条
             </el-button>
           </template>
         </el-table-column>
-        <el-table-column label="测流时间" min-width="170">
+        <el-table-column label="测流时间" min-width="160">
           <template #default="{ row }">
             <span class="gb-mono">{{ new Date(row.measuredAt).toLocaleString('zh-CN') }}</span>
           </template>
         </el-table-column>
-        <el-table-column label="操作" width="240" fixed="right">
+        <el-table-column label="操作" width="330" fixed="right">
           <template #default="{ row }">
             <el-button size="small" type="primary" :icon="Right" @click="gotoVerticals(row)">垂线</el-button>
+            <el-button
+              size="small"
+              type="success"
+              plain
+              :disabled="row.refStatus !== '对账中' || row.reported"
+              @click="reportSectionFlow(row)"
+            >
+              报流量
+            </el-button>
+            <el-button
+              v-if="row.refStatus !== '对账中'"
+              size="small"
+              type="warning"
+              plain
+              @click="gotoReconcile(row)"
+            >
+              对账
+            </el-button>
             <el-button size="small" :icon="Edit" @click="openEdit(row)">编辑</el-button>
             <el-button size="small" type="danger" plain :icon="Delete" @click="removeSection(row)">删除</el-button>
           </template>
@@ -386,5 +522,35 @@ onMounted(() => {
   margin-left: 8px;
   font-size: 12px;
   color: #8194a2;
+}
+
+.page__held-alert {
+  align-items: center;
+}
+
+.page__held-actions {
+  margin-top: 6px;
+}
+
+.page__ref-cell {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.page__ref-note {
+  display: block;
+  margin-top: 2px;
+  font-size: 12px;
+  color: #8194a2;
+}
+
+:deep(.gb-row-held) {
+  --el-table-row-hover-bg-color: #fdf3ec;
+}
+
+:deep(.gb-row-held td) {
+  background-color: #fbf4ee !important;
+  color: #8a6a55;
 }
 </style>

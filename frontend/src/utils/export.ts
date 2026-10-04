@@ -11,9 +11,21 @@ import {
   stampBackupTime,
   type BackupPayload
 } from '@/utils/db'
+import type { CodeEvent } from '@/types/codeEvent'
+import type { Section, RefStatus } from '@/types/section'
+import { buildCodeIndex, migrateLegacyRef } from '@/utils/reconcile'
+import { buildLedgerViews } from '@/utils/db'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
+export const BACKUP_KEYS = [
+  'stations',
+  'sections',
+  'verticals',
+  'points',
+  'ratings',
+  'compares',
+  'codeEvents'
+] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 /** 各表行数统计（导出页展示与导入结果回执共用） */
@@ -21,13 +33,14 @@ export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, codeEvents] = await Promise.all([
     db.stations.toArray(),
     db.sections.toArray(),
     db.verticals.toArray(),
     db.points.toArray(),
     db.ratings.toArray(),
-    db.compares.toArray()
+    db.compares.toArray(),
+    db.codeEvents.toArray()
   ])
   return {
     app: 'gbhydrogaug',
@@ -38,7 +51,8 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     verticals,
     points,
     ratings,
-    compares
+    compares,
+    codeEvents
   }
 }
 
@@ -52,7 +66,9 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
   if (obj.app !== 'gbhydrogaug' && obj.app !== undefined) {
     errors.push('app 字段应为 gbhydrogaug，文件来源不明')
   }
-  for (const key of BACKUP_KEYS) {
+  // 六张业务表为必需；codeEvents 为 v3 新增，旧备份缺失时按空台账兼容导入
+  const requiredKeys = BACKUP_KEYS.filter((key) => key !== 'codeEvents')
+  for (const key of requiredKeys) {
     if (!Array.isArray(obj[key])) errors.push(`${key} 字段缺失或不是数组`)
   }
   if (errors.length > 0) return { ok: false, errors, payload: null }
@@ -65,9 +81,74 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     verticals: obj.verticals ?? [],
     points: obj.points ?? [],
     ratings: obj.ratings ?? [],
-    compares: obj.compares ?? []
+    compares: obj.compares ?? [],
+    codeEvents: Array.isArray(obj.codeEvents) ? (obj.codeEvents as CodeEvent[]) : []
   }
+  normalizePayloadToV3(payload)
   return { ok: true, errors, payload }
+}
+
+/**
+ * 旧版备份（v2 及以前）归一化到当前结构：
+ * 测站补编号版本字段并按现存编号补台账；旧测次没记版本的先迁到现存编号再启用，
+ * 补不齐的置「待认领」，与首次打开数据库的迁移口径一致。
+ */
+export function normalizePayloadToV3(payload: BackupPayload): void {
+  const now = Date.now()
+  const seenLedger = new Set(payload.codeEvents.map((event) => event.sectionCode))
+  payload.stations.forEach((station, index) => {
+    if (typeof station.codeVersion !== 'number') station.codeVersion = 1
+    if (station.lifecycle !== '现行' && station.lifecycle !== '已撤' && station.lifecycle !== '已并走') {
+      station.lifecycle = '现行'
+    }
+    if (typeof station.mergedToCode !== 'string') station.mergedToCode = ''
+    if (station.sectionCode && !seenLedger.has(station.sectionCode)) {
+      seenLedger.add(station.sectionCode)
+      payload.codeEvents.push({
+        id: `cev_import_${station.id}_${index}`,
+        sectionCode: station.sectionCode,
+        codeVersion: station.codeVersion,
+        lifecycle: station.lifecycle,
+        eventType: '指派',
+        stationId: station.id,
+        stationName: station.name,
+        river: station.river,
+        catchmentKm2: station.catchmentKm2,
+        mergedToCode: station.mergedToCode,
+        reason: '旧备份导入：按现存测站补建编号台账',
+        occurredAt: new Date(station.createdAt ?? now).toISOString(),
+        createdAt: now,
+        updatedAt: now
+      })
+    }
+  })
+
+  const codeIndex = buildCodeIndex(buildLedgerViews(payload.codeEvents))
+  payload.sections.forEach((section) => {
+    if (typeof section.refCode !== 'string') section.refCode = ''
+    const hasVersion = typeof section.refVersion === 'number'
+    if (!hasVersion) section.refVersion = null
+    const validStatus: RefStatus[] = ['对账中', '悬空', '待认领']
+    if (!validStatus.includes(section.refStatus)) section.refStatus = '对账中'
+    if (typeof section.refNote !== 'string') section.refNote = ''
+    if (typeof section.reported !== 'boolean') section.reported = false
+    if (typeof section.reportedFlowM3s !== 'number') section.reportedFlowM3s = null
+    if (typeof section.reportedAt !== 'string') section.reportedAt = null
+    if (!hasVersion) {
+      const patch = migrateLegacyRef(
+        {
+          stationId: section.stationId,
+          refCode: section.refCode,
+          refVersion: null,
+          refStatus: section.refStatus,
+          refNote: section.refNote
+        },
+        payload.stations,
+        codeIndex
+      )
+      Object.assign(section, patch)
+    }
+  })
 }
 
 /** 统计快照各表行数 */
@@ -78,7 +159,8 @@ export function countPayload(payload: BackupPayload): CountMap {
     verticals: payload.verticals.length,
     points: payload.points.length,
     ratings: payload.ratings.length,
-    compares: payload.compares.length
+    compares: payload.compares.length,
+    codeEvents: payload.codeEvents.length
   }
 }
 
@@ -116,7 +198,7 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.codeEvents],
     async () => {
       await db.stations.bulkPut(payload.stations)
       await db.sections.bulkPut(payload.sections)
@@ -124,6 +206,7 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
       await db.points.bulkPut(payload.points)
       await db.ratings.bulkPut(payload.ratings)
       await db.compares.bulkPut(payload.compares)
+      await db.codeEvents.bulkPut(payload.codeEvents)
     }
   )
   return countPayload(payload)
@@ -166,7 +249,13 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     id: createId('cmp'),
     ratingId: ratingMap.get(compare.ratingId) ?? compare.ratingId
   }))
-  return { ...payload, stations, sections, verticals, points, ratings, compares }
+  // 编号台账事件也重排主键；事件内的 stationId 跟随映射，编号文本（sectionCode）保持不动
+  const codeEvents = payload.codeEvents.map((event) => ({
+    ...event,
+    id: createId('cev'),
+    stationId: stationMap.get(event.stationId) ?? event.stationId
+  }))
+  return { ...payload, stations, sections, verticals, points, ratings, compares, codeEvents }
 }
 
 /**

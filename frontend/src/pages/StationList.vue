@@ -6,13 +6,14 @@
 import { computed, onMounted, reactive, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { ElMessage, ElMessageBox } from 'element-plus'
-import { Cpu, Delete, Edit, Plus, Right, Warning } from '@element-plus/icons-vue'
+import { ArrowDown, Cpu, Delete, Edit, Plus, Right, Warning } from '@element-plus/icons-vue'
 import FilterBar from '@/components/common/FilterBar.vue'
 import type { FilterModel } from '@/types/filter'
 import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useRatingStore } from '@/stores/ratingStore'
+import { useReconcileStore } from '@/stores/reconcileStore'
 import { CATCHMENT_BUCKETS, createEmptyStationFilter, type Station } from '@/types/station'
 import { initDatabase } from '@/utils/db'
 
@@ -20,6 +21,7 @@ const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const ratingStore = useRatingStore()
+const reconcileStore = useReconcileStore()
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -31,6 +33,17 @@ const form = reactive({
   sectionCode: '',
   remark: ''
 })
+
+/** 撤号弹窗 */
+const withdrawVisible = ref(false)
+const withdrawTarget = ref<Station | null>(null)
+const withdrawReason = ref('')
+/** 并号弹窗 */
+const mergeVisible = ref(false)
+const mergeTarget = ref<Station | null>(null)
+const mergeCode = ref<string>('')
+const mergeReason = ref('')
+const codeBusy = ref(false)
 
 const filterModel = computed<FilterModel>(() => ({
   keyword: stationStore.filter.keyword,
@@ -53,9 +66,16 @@ const stationCards = computed(() =>
     const ratingIds = new Set(ratings.map((rating) => rating.id))
     const compares = ratingStore.compares.filter((compare) => ratingIds.has(compare.ratingId))
     const overLimit = compares.filter((compare) => compare.verdict === '超限').length
+    const heldCount = reconcileStore.sections
+      .filter(
+        (section) =>
+          section.stationId === station.id &&
+          (section.refCode === station.sectionCode || section.stationId === station.id)
+      )
+      .filter((section) => section.refStatus !== '对账中').length
     const qualifyRate =
       compares.length === 0 ? 0 : Number((((compares.length - overLimit) / compares.length) * 100).toFixed(0))
-    return { station, stats, ratingCount: ratings.length, overLimit, qualifyRate }
+    return { station, stats, ratingCount: ratings.length, overLimit, qualifyRate, heldCount }
   })
 )
 
@@ -123,7 +143,7 @@ function openEdit(station: Station): void {
   form.name = station.name
   form.river = station.river
   form.catchmentKm2 = station.catchmentKm2
-  form.sectionCode = station.sectionCode
+  form.sectionCode = `${station.sectionCode} v${station.codeVersion}（${station.lifecycle}）`
   form.remark = station.remark
   dialogVisible.value = true
 }
@@ -144,12 +164,35 @@ async function submitForm(): Promise<void> {
   submitting.value = true
   try {
     if (editingId.value) {
-      await stationStore.updateStation(editingId.value, { ...form })
-      ElMessage.success('测站信息已更新')
+      // 河名 / 集水面积可由站网科更新；断面编号与版本不在此改（撤并/换版走专门动作）
+      await stationStore.updateStation(editingId.value, {
+        name: form.name,
+        river: form.river,
+        catchmentKm2: form.catchmentKm2,
+        remark: form.remark
+      })
+      ElMessage.success('测站信息已更新（编号版本由站网科专门动作维护）')
     } else {
-      const created = await stationStore.createStation({ ...form })
+      const created = await stationStore.createStation({
+        name: form.name,
+        river: form.river,
+        catchmentKm2: form.catchmentKm2,
+        sectionCode: form.sectionCode,
+        remark: form.remark,
+        codeVersion: 1,
+        lifecycle: '现行',
+        mergedToCode: ''
+      })
+      await reconcileStore.appendCodeEvent({
+        sectionCode: created.sectionCode,
+        codeVersion: 1,
+        lifecycle: '现行',
+        eventType: '指派',
+        station: created,
+        reason: '新建测站，站网科指派编号'
+      })
       stationStore.selectStation(created.id)
-      ElMessage.success('测站已新建，可进入断面测次录入')
+      ElMessage.success('测站已新建并登记编号台账，可进入断面测次录入')
     }
     dialogVisible.value = false
   } finally {
@@ -176,6 +219,85 @@ function gotoSections(station: Station): void {
   void router.push(`/stations/${station.id}/sections`)
 }
 
+function gotoReconcile(): void {
+  void router.push('/reconcile')
+}
+
+function handleCodeAction(action: string, station: Station): void {
+  if (action === 'withdraw') openWithdraw(station)
+  else if (action === 'merge') openMerge(station)
+  else if (action === 'bump') void bumpVersion(station)
+}
+
+/** 可并入的现行编号（排除自身与已撤并编号） */
+const mergeCodeOptions = computed(() =>
+  reconcileStore.activeCodes
+    .filter((ledger) => ledger.sectionCode !== mergeTarget.value?.sectionCode)
+    .map((ledger) => ({
+      value: ledger.sectionCode,
+      label: `${ledger.sectionCode} v${ledger.codeVersion} · ${ledger.stationName}（${ledger.river}）`
+    }))
+)
+
+function openWithdraw(station: Station): void {
+  withdrawTarget.value = station
+  withdrawReason.value = ''
+  withdrawVisible.value = true
+}
+
+async function confirmWithdraw(): Promise<void> {
+  if (!withdrawTarget.value) return
+  codeBusy.value = true
+  try {
+    const affected = await reconcileStore.withdrawCode(withdrawTarget.value, withdrawReason.value.trim())
+    ElMessage.success(`编号 ${withdrawTarget.value.sectionCode} 已撤，${affected} 个测次悬空暂停报量`)
+    withdrawVisible.value = false
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '撤号失败')
+  } finally {
+    codeBusy.value = false
+  }
+}
+
+function openMerge(station: Station): void {
+  mergeTarget.value = station
+  mergeCode.value = mergeCodeOptions.value[0]?.value ?? ''
+  mergeReason.value = ''
+  mergeVisible.value = true
+}
+
+async function confirmMerge(): Promise<void> {
+  if (!mergeTarget.value) return
+  if (!mergeCode.value) {
+    ElMessage.warning('请选择并入的现行编号')
+    return
+  }
+  codeBusy.value = true
+  try {
+    const affected = await reconcileStore.mergeCode(mergeTarget.value, mergeCode.value, mergeReason.value.trim())
+    ElMessage.success(`编号 ${mergeTarget.value.sectionCode} 已并入 ${mergeCode.value}，${affected} 个测次悬空等重新指派`)
+    mergeVisible.value = false
+  } catch (err) {
+    ElMessage.error(err instanceof Error ? err.message : '并号失败')
+  } finally {
+    codeBusy.value = false
+  }
+}
+
+async function bumpVersion(station: Station): Promise<void> {
+  try {
+    await ElMessageBox.confirm(
+      `编号 ${station.sectionCode} 换版到 v${station.codeVersion + 1} 后，引用旧版本的测次将悬空、暂停报量，等重新指派。确认换版？`,
+      '编号换版',
+      { type: 'warning', confirmButtonText: '换版', cancelButtonText: '取消' }
+    )
+  } catch {
+    return
+  }
+  const affected = await reconcileStore.bumpCodeVersion(station, '站网科编号换版')
+  ElMessage.success(`已换版到 v${station.codeVersion + 1}，${affected} 个测次悬空等重新指派`)
+}
+
 async function reseed(): Promise<void> {
   await initDatabase()
   ElMessage.success('已按需补齐演示数据（幂等播种）')
@@ -183,6 +305,7 @@ async function reseed(): Promise<void> {
 
 onMounted(() => {
   applyQueryToFilter()
+  reconcileStore.start()
   if (stationStore.stations.length === 0) void reseed()
 })
 
@@ -276,7 +399,25 @@ watch(
               <strong class="station-card__name">{{ card.station.name }}</strong>
               <el-tag size="small" effect="plain" class="station-card__river">{{ card.station.river }}</el-tag>
             </div>
-            <el-tag size="small" type="info" effect="plain">{{ card.station.sectionCode }}</el-tag>
+            <div class="station-card__codes">
+              <el-tag size="small" type="info" effect="plain">
+                {{ card.station.sectionCode }} v{{ card.station.codeVersion }}
+              </el-tag>
+              <el-tag
+                size="small"
+                :type="
+                  card.station.lifecycle === '现行'
+                    ? 'success'
+                    : card.station.lifecycle === '已撤'
+                      ? 'danger'
+                      : 'warning'
+                "
+                effect="dark"
+              >
+                {{ card.station.lifecycle
+                }}<template v-if="card.station.lifecycle === '已并走'"> → {{ card.station.mergedToCode }}</template>
+              </el-tag>
+            </div>
           </div>
         </template>
 
@@ -304,7 +445,11 @@ watch(
         <div class="station-card__meta">
           <span>集水面积 <b class="gb-mono">{{ card.station.catchmentKm2 }}</b> km²</span>
           <span>关系点据 <b class="gb-mono">{{ card.ratingCount }}</b> 个</span>
-          <span v-if="card.overLimit > 0" class="station-card__alert">
+          <span v-if="card.heldCount > 0" class="station-card__alert" @click="gotoReconcile">
+            <el-icon><Warning /></el-icon>
+            <el-button text type="warning" size="small">{{ card.heldCount }} 个测次编号悬空 / 待认领</el-button>
+          </span>
+          <span v-else-if="card.overLimit > 0" class="station-card__alert">
             <el-icon><Warning /></el-icon> 超限 <b class="gb-mono">{{ card.overLimit }}</b> 条
           </span>
         </div>
@@ -316,6 +461,20 @@ watch(
             断面测次
           </el-button>
           <el-button size="small" :icon="Edit" @click="openEdit(card.station)">编辑</el-button>
+          <el-dropdown
+            v-if="card.station.lifecycle === '现行'"
+            trigger="click"
+            @command="(value: string) => handleCodeAction(value, card.station)"
+          >
+            <el-button size="small" type="warning" plain>编号操作<el-icon class="el-icon--right"><ArrowDown /></el-icon></el-button>
+            <template #dropdown>
+              <el-dropdown-menu>
+                <el-dropdown-item command="withdraw">撤掉编号</el-dropdown-item>
+                <el-dropdown-item command="merge">并走到…</el-dropdown-item>
+                <el-dropdown-item command="bump">换版 v{{ card.station.codeVersion + 1 }}</el-dropdown-item>
+              </el-dropdown-menu>
+            </template>
+          </el-dropdown>
           <el-button size="small" type="danger" plain :icon="Delete" @click="removeStation(card.station)">
             删除
           </el-button>
@@ -354,7 +513,13 @@ watch(
           <span class="page__unit">km²</span>
         </el-form-item>
         <el-form-item label="断面编号" required>
-          <el-input v-model="form.sectionCode" placeholder="如：CS-LM-01" maxlength="24" />
+          <el-input
+            v-model="form.sectionCode"
+            :placeholder="editingId ? '' : '如：CS-LM-01'"
+            :disabled="!!editingId"
+            maxlength="24"
+          />
+          <div v-if="editingId" class="gb-hint">断面编号与版本归站网科，撤号 / 并号 / 换版请用卡片上的「编号操作」。</div>
         </el-form-item>
         <el-form-item label="备注">
           <el-input v-model="form.remark" type="textarea" :rows="2" placeholder="测验方式、断面稳定性说明等" maxlength="120" />
@@ -365,6 +530,57 @@ watch(
         <el-button type="primary" :loading="submitting" @click="submitForm">
           {{ editingId ? '保存修改' : '新建并进入录入' }}
         </el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="withdrawVisible" title="站网科撤掉断面编号" width="520px" :close-on-click-modal="false">
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        title="撤号后，引用该编号的测次立即悬空、暂停报流量；先前报出去的流量按当时编号仍可查。"
+        class="page__code-alert"
+      />
+      <el-form label-width="96px">
+        <el-form-item label="断面编号">
+          <el-tag type="danger" effect="plain">{{ withdrawTarget?.sectionCode }} v{{ withdrawTarget?.codeVersion }}</el-tag>
+        </el-form-item>
+        <el-form-item label="撤号原因">
+          <el-input v-model="withdrawReason" type="textarea" :rows="2" maxlength="120" show-word-limit
+            placeholder="如：临时断面撤销 / 测验断面取消" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="withdrawVisible = false">取消</el-button>
+        <el-button type="danger" :loading="codeBusy" @click="confirmWithdraw">确认撤号</el-button>
+      </template>
+    </el-dialog>
+
+    <el-dialog v-model="mergeVisible" title="站网科并走断面编号" width="560px" :close-on-click-modal="false">
+      <el-alert
+        type="warning"
+        :closable="false"
+        show-icon
+        title="并号后源编号置「已并走」，其测次悬空等重新指派；并入的目标（站网科）编号不动。"
+        class="page__code-alert"
+      />
+      <el-form label-width="96px">
+        <el-form-item label="源编号">
+          <el-tag type="warning" effect="plain">{{ mergeTarget?.sectionCode }} v{{ mergeTarget?.codeVersion }}</el-tag>
+        </el-form-item>
+        <el-form-item label="并入编号">
+          <el-select v-model="mergeCode" placeholder="选择现行编号" style="width: 100%">
+            <el-option v-for="option in mergeCodeOptions" :key="option.value" :label="option.label" :value="option.value" />
+          </el-select>
+        </el-form-item>
+        <el-form-item label="并号说明">
+          <el-input v-model="mergeReason" type="textarea" :rows="2" maxlength="120" show-word-limit
+            placeholder="如：断面整编，两断面合并" />
+        </el-form-item>
+      </el-form>
+      <template #footer>
+        <el-button @click="mergeVisible = false">取消</el-button>
+        <el-button type="warning" :loading="codeBusy" @click="confirmMerge">确认并号</el-button>
       </template>
     </el-dialog>
   </section>
@@ -436,6 +652,16 @@ watch(
 
 .station-card__river {
   margin-left: 8px;
+}
+
+.station-card__codes {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.page__code-alert {
+  margin-bottom: 12px;
 }
 
 .station-card__stats {

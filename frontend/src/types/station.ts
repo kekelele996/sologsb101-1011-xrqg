@@ -1,7 +1,9 @@
 /** 水位流量关系点据的定线编号（可多条并存，用于区分不同年份的绳套曲线） */
 export const LINE_NOS = ['A', 'B', 'C'] as const
 
-/** 测站：水文测验的基本单元 */
+import type { CodeLifecycle } from '@/types/codeEvent'
+
+/** 测站：水文测验的基本单元（河名、集水面积、断面编号归站网科定） */
 export interface Station {
   id: string
   /** 站名 */
@@ -12,6 +14,12 @@ export interface Station {
   catchmentKm2: number
   /** 断面编号，如 CS-01 */
   sectionCode: string
+  /** 断面编号版本（站网科换版时 +1，巡测队按「编号 + 版本」引用） */
+  codeVersion: number
+  /** 编号生命周期：现行 / 已撤 / 已并走，撤并后引用它的测次悬空 */
+  lifecycle: CodeLifecycle
+  /** 并号目标编号（已并走时指向并入的现行编号） */
+  mergedToCode: string
   /** 备注 */
   remark: string
   createdAt: number

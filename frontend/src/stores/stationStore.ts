@@ -112,7 +112,16 @@ export const useStationStore = defineStore('station', () => {
 
   async function createStation(payload: Omit<Station, 'id' | 'createdAt' | 'updatedAt'>): Promise<Station> {
     const now = Date.now()
-    const row: Station = { ...payload, id: createId('stn'), createdAt: now, updatedAt: now }
+    const row: Station = {
+      ...payload,
+      // 站网科新编号缺省补 v1 / 现行（显式传入时以传入为准）
+      codeVersion: payload.codeVersion ?? 1,
+      lifecycle: payload.lifecycle ?? '现行',
+      mergedToCode: payload.mergedToCode ?? '',
+      id: createId('stn'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.stations.put(row)
     return row
   }

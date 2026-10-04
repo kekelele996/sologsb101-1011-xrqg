@@ -234,6 +234,25 @@ onMounted(() => {
         :title="`起点距排序校验未通过：垂线 ${conflicts.join('、')} 的起点距与其他垂线重复，请调整后再参与流量计算`"
       />
 
+      <el-alert
+        v-if="section.refStatus !== '对账中'"
+        :type="section.refStatus === '悬空' ? 'error' : 'warning'"
+        show-icon
+        :closable="false"
+        class="page__held-alert"
+      >
+        <template #title>
+          该测次引用编号 {{ section.refCode }}
+          {{ section.refStatus === '悬空' ? '已撤或并走，测次先搁着，这期间流量先不报' : '版本补不齐，待人工认领' }}；
+          先前报出去的按当时编号仍可查。
+        </template>
+        <div class="page__held-actions">
+          <el-button size="small" type="primary" @click="router.push({ path: '/reconcile', query: { focus: section.id } })">
+            去编号对账台
+          </el-button>
+        </div>
+      </el-alert>
+
       <EmptyPanel
         v-if="verticalRows.length === 0"
         title="该测次还没有垂线"
@@ -385,5 +404,13 @@ onMounted(() => {
   margin-left: 4px;
   color: #d68910;
   vertical-align: middle;
+}
+
+.page__held-alert {
+  align-items: center;
+}
+
+.page__held-actions {
+  margin-top: 6px;
 }
 </style>

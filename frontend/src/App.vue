@@ -5,10 +5,11 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
+import { Connection, DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useRatingStore } from '@/stores/ratingStore'
+import { useReconcileStore } from '@/stores/reconcileStore'
 import { DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -16,11 +17,13 @@ const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
 const ratingStore = useRatingStore()
+const reconcileStore = useReconcileStore()
 
 onMounted(() => {
   stationStore.start()
   sectionStore.start()
   ratingStore.start()
+  reconcileStore.start()
 })
 
 /** 层级路由统一归属到最上层导航项 */
@@ -28,11 +31,21 @@ const activeKey = computed(() => {
   if (route.path.startsWith('/stations/')) return '/stations'
   if (route.path.startsWith('/sections/')) return '/stations'
   if (route.path.startsWith('/verticals/')) return '/stations'
+  if (route.path.startsWith('/reconcile')) return '/reconcile'
   return route.path
 })
 
+/** 悬空 + 待认领合计，导航红点提示 */
+const heldTotal = computed(() => reconcileStore.summary.dangling + reconcileStore.summary.pending)
+
 const navItems = computed(() => [
   { key: '/stations', label: '测站台账', icon: Odometer, badge: String(stationStore.stations.length) },
+  {
+    key: '/reconcile',
+    label: '编号对账',
+    icon: Connection,
+    badge: heldTotal.value > 0 ? String(heldTotal.value) : ''
+  },
   { key: '/ratings', label: '关系点据与定线', icon: TrendCharts, badge: String(ratingStore.ratings.length) },
   { key: '/export', label: '比测与导出', icon: PieChart, badge: String(ratingStore.overLimitRows.length) }
 ])
@@ -84,7 +97,9 @@ function go(path: string): void {
         >
           <el-icon><component :is="item.icon" /></el-icon>
           <span>{{ item.label }}</span>
-          <em v-if="item.badge" class="app-nav__badge">{{ item.badge }}</em>
+          <em v-if="item.badge" class="app-nav__badge" :class="{ 'app-nav__badge--alert': item.key === '/reconcile' }">
+            {{ item.badge }}
+          </em>
         </button>
       </nav>
     </header>
@@ -207,6 +222,11 @@ function go(path: string): void {
   padding: 0 6px;
   border-radius: 8px;
   background: rgba(0, 0, 0, 0.18);
+}
+
+.app-nav__badge--alert {
+  background: #e74c3c;
+  color: #fff;
 }
 
 .app-context {

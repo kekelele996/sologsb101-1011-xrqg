@@ -12,12 +12,14 @@ import type { Vertical } from '@/types/vertical'
 import type { Point } from '@/types/point'
 import type { Rating } from '@/types/rating'
 import type { Compare } from '@/types/compare'
+import type { CodeEvent, CodeLedgerView } from '@/types/codeEvent'
 import { calcDeviationPct, judgeDeviation } from '@/types/compare'
 import { fitPowerCurve } from '@/types/rating'
 import { calcMeanVelocity, DEFAULT_WEIGHTS, round } from '@/utils/flow'
+import { buildCodeIndex, migrateLegacyRef } from '@/utils/reconcile'
 
 /** 当前数据结构版本号：每次调整字段结构必须 +1 并补迁移 */
-export const DB_VERSION = 2
+export const DB_VERSION = 3
 
 /** 数据库名（浏览器 IndexedDB 中的库名） */
 export const DB_NAME = 'gbhydrogaug'
@@ -40,6 +42,7 @@ export interface BackupPayload {
   points: Point[]
   ratings: Rating[]
   compares: Compare[]
+  codeEvents: CodeEvent[]
 }
 
 class HydroGaugeDatabase extends Dexie {
@@ -49,6 +52,8 @@ class HydroGaugeDatabase extends Dexie {
   points!: Table<Point, string>
   ratings!: Table<Rating, string>
   compares!: Table<Compare, string>
+  /** 站网科编号台账事件流（指派 / 撤号 / 并号 / 换版） */
+  codeEvents!: Table<CodeEvent, string>
 
   constructor() {
     super(DB_NAME)
@@ -64,17 +69,31 @@ class HydroGaugeDatabase extends Dexie {
     })
 
     // v2：补齐筛选与统计需要的索引（河名/集水面积、水位、测法、偏差判定）
+    this.version(2).stores({
+      stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
+      sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
+      verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
+      points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
+      ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
+      compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt'
+    })
+
+    // v3：站网科编号版本化。新增 codeEvents 台账表；
+    // 测站补编号版本 / 生命周期，测次补引用编号 / 对账状态 / 上报状态。
+    // 旧数据没记编号版本：upgrade 中先按现存编号迁移，补不齐的置待认领带出。
     this.version(DB_VERSION)
       .stores({
-        stations: 'id, name, river, sectionCode, catchmentKm2, updatedAt',
-        sections: 'id, stationId, measureNo, method, stageM, measuredAt, updatedAt',
+        stations: 'id, name, river, sectionCode, codeVersion, lifecycle, catchmentKm2, updatedAt',
+        sections:
+          'id, stationId, measureNo, refCode, refStatus, reported, method, stageM, measuredAt, updatedAt',
         verticals: 'id, sectionId, no, startDistanceM, depthM, updatedAt',
         points: 'id, verticalId, relativeDepth, velocityMs, updatedAt',
         ratings: 'id, stationId, lineNo, stageM, flowM3s, measuredAt, updatedAt',
-        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt'
+        compares: 'id, ratingId, verdict, deviationPct, comparedAt, updatedAt',
+        codeEvents: 'id, sectionCode, codeVersion, lifecycle, stationId, eventType, occurredAt'
       })
       .upgrade(async (tx) => {
-        // 迁移：历史数据补齐时间戳与判定结论，避免列表排序与筛选拿到 undefined
+        // 1) 历史数据补齐时间戳与 v2 默认字段（老用户从 v1/v2 直升 v3 同样适用）
         const stamps: Array<[string, () => Record<string, unknown>]> = [
           ['stations', () => ({})],
           ['sections', () => ({ measuredAt: new Date().toISOString() })],
@@ -94,6 +113,87 @@ class HydroGaugeDatabase extends Dexie {
               Object.assign(row, defaults())
             })
         }
+
+        // 2) 测站补站网科编号版本字段，并为每个现存编号补一条「指派」台账事件
+        const stationRows: Station[] = await tx.table<Station, string>('stations').toArray()
+        const now = Date.now()
+        const seedLedgerEvents: CodeEvent[] = []
+        await tx
+          .table<Station, string>('stations')
+          .toCollection()
+          .modify((station) => {
+            if (typeof station.codeVersion !== 'number') station.codeVersion = 1
+            if (station.lifecycle !== '现行' && station.lifecycle !== '已撤' && station.lifecycle !== '已并走') {
+              station.lifecycle = '现行'
+            }
+            if (typeof station.mergedToCode !== 'string') station.mergedToCode = ''
+            const code = String(station.sectionCode ?? '')
+            if (code) {
+              seedLedgerEvents.push({
+                id: `cev_${station.id}`,
+                sectionCode: code,
+                codeVersion: Number(station.codeVersion ?? 1),
+                lifecycle: station.lifecycle,
+                eventType: '指派',
+                stationId: String(station.id),
+                stationName: String(station.name ?? ''),
+                river: String(station.river ?? ''),
+                catchmentKm2: Number(station.catchmentKm2 ?? 0),
+                mergedToCode: String(station.mergedToCode ?? ''),
+                reason: '编号版本化迁移：按现存测站补建台账',
+                occurredAt: new Date(Number(station.createdAt ?? now)).toISOString(),
+                createdAt: now,
+                updatedAt: now
+              })
+            }
+          })
+        if (seedLedgerEvents.length > 0) {
+          await tx.table<CodeEvent, string>('codeEvents').bulkPut(seedLedgerEvents)
+        }
+
+        // 3) 测次补引用 / 上报字段；旧数据没记编号版本 → 先迁移到现存编号再启用，
+        //    补不齐（编号已撤并或查不到）的置「待认领 / 悬空」交人认。
+        const ledgers = buildLedgerViews(seedLedgerEvents)
+        const codeIndex = buildCodeIndex(ledgers)
+        await tx
+          .table<Section, string>('sections')
+          .toCollection()
+          .modify((section) => {
+            if (typeof section.refCode !== 'string') {
+              const owner = stationRows.find((station) => station.id === section.stationId)
+              section.refCode = owner?.sectionCode ?? ''
+            }
+            if (typeof section.refVersion !== 'number' && section.refVersion !== null) {
+              section.refVersion = null
+            }
+            if (
+              section.refStatus !== '对账中' &&
+              section.refStatus !== '悬空' &&
+              section.refStatus !== '待认领'
+            ) {
+              section.refStatus = '对账中'
+            }
+            if (typeof section.refNote !== 'string') section.refNote = ''
+            if (typeof section.reported !== 'boolean') section.reported = false
+            if (typeof section.reportedFlowM3s !== 'number' && section.reportedFlowM3s !== null) {
+              section.reportedFlowM3s = null
+            }
+            if (typeof section.reportedAt !== 'string' && section.reportedAt !== null) {
+              section.reportedAt = null
+            }
+            const patch = migrateLegacyRef(
+              {
+                stationId: String(section.stationId ?? ''),
+                refCode: String(section.refCode ?? ''),
+                refVersion: section.refVersion ?? null,
+                refStatus: section.refStatus,
+                refNote: String(section.refNote ?? '')
+              },
+              stationRows,
+              codeIndex
+            )
+            Object.assign(section, patch)
+          })
       })
   }
 }
@@ -104,6 +204,47 @@ export const db = new HydroGaugeDatabase()
 export function createId(prefix: string): string {
   const rand = Math.random().toString(36).slice(2, 8)
   return `${prefix}_${Date.now().toString(36)}${rand}`
+}
+
+/**
+ * 把编号事件流折叠成「每条编号一个当前态」的台账视图，
+ * 同编号取版本号最大的事件为当前态，事件按时间升序保留为历史。
+ */
+export function buildLedgerViews(events: CodeEvent[]): CodeLedgerView[] {
+  const grouped = new Map<string, CodeEvent[]>()
+  events.forEach((event) => {
+    const list = grouped.get(event.sectionCode) ?? []
+    list.push(event)
+    grouped.set(event.sectionCode, list)
+  })
+  const views: CodeLedgerView[] = []
+  grouped.forEach((list, sectionCode) => {
+    const ordered = [...list].sort((a, b) =>
+      a.codeVersion === b.codeVersion ? a.createdAt - b.createdAt : a.codeVersion - b.codeVersion
+    )
+    const current = ordered.reduce<CodeEvent | null>((latest, event) => {
+      if (!latest) return event
+      return event.codeVersion >= latest.codeVersion ? event : latest
+    }, null)
+    if (!current) return
+    views.push({
+      sectionCode,
+      codeVersion: current.codeVersion,
+      lifecycle: current.lifecycle,
+      stationId: current.stationId,
+      stationName: current.stationName,
+      river: current.river,
+      catchmentKm2: current.catchmentKm2,
+      mergedToCode: current.mergedToCode,
+      events: ordered
+    })
+  })
+  return views.sort((a, b) => a.sectionCode.localeCompare(b.sectionCode))
+}
+
+/** 读取编号台账视图（liveQuery / 对账台共用） */
+export async function listCodeLedgerViews(): Promise<CodeLedgerView[]> {
+  return buildLedgerViews(await db.codeEvents.toArray())
 }
 
 /** 订阅单表变化（liveQuery），返回取消订阅函数 */
@@ -129,9 +270,18 @@ interface SeedStationBundle {
   points: Array<Omit<Point, 'createdAt' | 'updatedAt'>>
 }
 
+/** 旧测次迁移演示：引用的编号在现存台账中查不到（模拟无版本的历史测次） */
+interface SeedLegacyOrphan {
+  section: Omit<Section, 'createdAt' | 'updatedAt'>
+}
+
 /**
  * 播种演示数据：3 个测站 → 4 个断面测次 → 8 条垂线 → 16 个流速测点，
  * 并据此生成水位流量关系点据与比测记录，保证父 → 子 → 孙三层链路可点开。
+ * 编号对账另播种三类场景：
+ * - 撤号：CS-FL-04 已撤，其测次悬空、暂停报量；
+ * - 并号：白沙滩 CS-BS-03 已并入龙门 CS-LM-01，其测次悬空等重新指派；
+ * - 旧数据：一个没记编号版本、编号已查不到的历史测次，首迁后落「待认领」。
  */
 export async function seedDemoData(): Promise<void> {
   const now = Date.now()
@@ -145,6 +295,9 @@ export async function seedDemoData(): Promise<void> {
         river: '澜沧江',
         catchmentKm2: 45200,
         sectionCode: 'CS-LM-01',
+        codeVersion: 1,
+        lifecycle: '现行',
+        mergedToCode: '',
         remark: '基本水文站，缆道测流，断面稳定'
       },
       sections: [
@@ -152,6 +305,13 @@ export async function seedDemoData(): Promise<void> {
           id: 'sec_lh_2406',
           stationId: 'stn_lh01',
           measureNo: '2024-06-001',
+          refCode: 'CS-LM-01',
+          refVersion: 1,
+          refStatus: '对账中',
+          refNote: '编号 CS-LM-01 v1 对账一致',
+          reported: true,
+          reportedFlowM3s: 217.2,
+          reportedAt: '2024-06-12T10:00:00.000Z',
           startDistanceM: 12.5,
           stageM: 5.42,
           method: '流速仪',
@@ -161,6 +321,13 @@ export async function seedDemoData(): Promise<void> {
           id: 'sec_lh_2407',
           stationId: 'stn_lh01',
           measureNo: '2024-07-002',
+          refCode: 'CS-LM-01',
+          refVersion: 1,
+          refStatus: '对账中',
+          refNote: '编号 CS-LM-01 v1 对账一致',
+          reported: false,
+          reportedFlowM3s: null,
+          reportedAt: null,
           startDistanceM: 12.5,
           stageM: 6.15,
           method: 'ADCP',
@@ -193,6 +360,9 @@ export async function seedDemoData(): Promise<void> {
         river: '沅江',
         catchmentKm2: 1860,
         sectionCode: 'CS-QJ-02',
+        codeVersion: 1,
+        lifecycle: '现行',
+        mergedToCode: '',
         remark: '小河站，浮标法为主，洪水期加测'
       },
       sections: [
@@ -200,6 +370,13 @@ export async function seedDemoData(): Promise<void> {
           id: 'sec_qj_2405',
           stationId: 'stn_qj02',
           measureNo: '2024-05-003',
+          refCode: 'CS-QJ-02',
+          refVersion: 1,
+          refStatus: '对账中',
+          refNote: '编号 CS-QJ-02 v1 对账一致',
+          reported: true,
+          reportedFlowM3s: 56.1,
+          reportedAt: '2024-05-22T09:30:00.000Z',
           startDistanceM: 4.2,
           stageM: 3.18,
           method: '浮标',
@@ -209,6 +386,13 @@ export async function seedDemoData(): Promise<void> {
           id: 'sec_qj_2408',
           stationId: 'stn_qj02',
           measureNo: '2024-08-004',
+          refCode: 'CS-QJ-02',
+          refVersion: 1,
+          refStatus: '对账中',
+          refNote: '编号 CS-QJ-02 v1 对账一致',
+          reported: false,
+          reportedFlowM3s: null,
+          reportedAt: null,
           startDistanceM: 4.2,
           stageM: 4.36,
           method: '流速仪',
@@ -241,13 +425,25 @@ export async function seedDemoData(): Promise<void> {
         river: '澜沧江',
         catchmentKm2: 51200,
         sectionCode: 'CS-BS-03',
-        remark: '巡测断面，与龙门站比测'
+        codeVersion: 1,
+        // 演示「并号」：白沙滩断面编号已并走至龙门，编号本身不删，状态改已并走
+        lifecycle: '已并走',
+        mergedToCode: 'CS-LM-01',
+        remark: '巡测断面，已并入龙门站断面编号，测次等重新指派'
       },
       sections: [
         {
           id: 'sec_bs_2406',
           stationId: 'stn_bs03',
           measureNo: '2024-06-005',
+          refCode: 'CS-BS-03',
+          refVersion: 1,
+          refStatus: '悬空',
+          refNote: '编号 CS-BS-03 已并走（并入 CS-LM-01），等站网科重新指派',
+          // 撤并前已报出的流量保留，按当时编号仍可查
+          reported: true,
+          reportedFlowM3s: 203.5,
+          reportedAt: '2024-06-20T11:00:00.000Z',
           startDistanceM: 18.0,
           stageM: 5.36,
           method: 'ADCP',
@@ -269,6 +465,63 @@ export async function seedDemoData(): Promise<void> {
     }
   ]
 
+  /**
+   * 撤号演示测站：CS-FL-04 编号已撤（测站保留以承载历史），
+   * 其测次引用已撤编号 → 悬空，期间流量先不报。
+   */
+  const withdrawnStation: Omit<Station, 'createdAt' | 'updatedAt'> = {
+    id: 'stn_fl04',
+    name: '枫林临时断面',
+    river: '沅江',
+    catchmentKm2: 960,
+    sectionCode: 'CS-FL-04',
+    codeVersion: 1,
+    lifecycle: '已撤',
+    mergedToCode: '',
+    remark: '临时断面，编号已由站网科撤销，历史测次待重新指派'
+  }
+  const withdrawnSection: Omit<Section, 'createdAt' | 'updatedAt'> = {
+    id: 'sec_fl_2404',
+    stationId: 'stn_fl04',
+    measureNo: '2024-04-009',
+    refCode: 'CS-FL-04',
+    refVersion: 1,
+    refStatus: '悬空',
+    refNote: '编号 CS-FL-04 已撤，等站网科重新指派',
+    reported: false,
+    reportedFlowM3s: null,
+    reportedAt: null,
+    startDistanceM: 9.0,
+    stageM: 2.74,
+    method: '浮标',
+    measuredAt: '2024-04-16T08:20:00.000Z'
+  }
+
+  /**
+   * 旧数据演示：更早的历史测次没记编号版本，且所引编号 CS-GD-99 已查不到，
+   * 首次打开迁移补不齐 → 待人工认领（不挂测站，单独列在对账台）。
+   */
+  const legacyOrphanSections: SeedLegacyOrphan[] = [
+    {
+      section: {
+        id: 'sec_legacy_99',
+        stationId: '',
+        measureNo: '2021-09-007',
+        refCode: 'CS-GD-99',
+        refVersion: null,
+        refStatus: '待认领',
+        refNote: '旧编号 CS-GD-99 现存台账查不到，待人工认领',
+        reported: true,
+        reportedFlowM3s: 38.4,
+        reportedAt: '2021-09-05T09:00:00.000Z',
+        startDistanceM: 5.0,
+        stageM: 2.61,
+        method: '流速仪',
+        measuredAt: '2021-09-05T08:00:00.000Z'
+      }
+    }
+  ]
+
   // 水位流量关系点据：A 线为龙门站主定线，B 线为青矶站定线
   const ratingSeeds: Array<Omit<Rating, 'createdAt' | 'updatedAt'>> = [
     { id: 'rat_lh_a1', stationId: 'stn_lh01', stageM: 4.01, flowM3s: 97.5, lineNo: 'A', measureNo: '2024-04-001', measuredAt: '2024-04-08T08:00:00.000Z' },
@@ -287,23 +540,100 @@ export async function seedDemoData(): Promise<void> {
     { id: 'rat_bs_c4', stationId: 'stn_bs03', stageM: 6.44, flowM3s: 288.0, lineNo: 'C', measureNo: '2024-08-008', measuredAt: '2024-08-15T09:40:00.000Z' }
   ]
 
+  // 站网科编号台账事件：指派 + 撤号 + 并号
+  const codeEventSeeds: Array<Omit<CodeEvent, 'createdAt' | 'updatedAt'>> = [
+    {
+      id: 'cev_lm01',
+      sectionCode: 'CS-LM-01',
+      codeVersion: 1,
+      lifecycle: '现行',
+      eventType: '指派',
+      stationId: 'stn_lh01',
+      stationName: '龙门水文站',
+      river: '澜沧江',
+      catchmentKm2: 45200,
+      mergedToCode: '',
+      reason: '基本站编号指派',
+      occurredAt: '2024-01-05T00:00:00.000Z'
+    },
+    {
+      id: 'cev_qj02',
+      sectionCode: 'CS-QJ-02',
+      codeVersion: 1,
+      lifecycle: '现行',
+      eventType: '指派',
+      stationId: 'stn_qj02',
+      stationName: '青矶水位站',
+      river: '沅江',
+      catchmentKm2: 1860,
+      mergedToCode: '',
+      reason: '小河站编号指派',
+      occurredAt: '2024-01-05T00:00:00.000Z'
+    },
+    {
+      id: 'cev_bs03_assign',
+      sectionCode: 'CS-BS-03',
+      codeVersion: 1,
+      lifecycle: '现行',
+      eventType: '指派',
+      stationId: 'stn_bs03',
+      stationName: '白沙滩巡测站',
+      river: '澜沧江',
+      catchmentKm2: 51200,
+      mergedToCode: '',
+      reason: '巡测断面编号指派',
+      occurredAt: '2024-01-06T00:00:00.000Z'
+    },
+    {
+      id: 'cev_bs03_merge',
+      sectionCode: 'CS-BS-03',
+      codeVersion: 1,
+      lifecycle: '已并走',
+      eventType: '并号',
+      stationId: 'stn_bs03',
+      stationName: '白沙滩巡测站',
+      river: '澜沧江',
+      catchmentKm2: 51200,
+      mergedToCode: 'CS-LM-01',
+      reason: '站网科整编：白沙滩巡测断面并入龙门站断面编号',
+      occurredAt: '2024-09-02T00:00:00.000Z'
+    },
+    {
+      id: 'cev_fl04_withdraw',
+      sectionCode: 'CS-FL-04',
+      codeVersion: 1,
+      lifecycle: '已撤',
+      eventType: '撤号',
+      stationId: 'stn_fl04',
+      stationName: '枫林临时断面',
+      river: '沅江',
+      catchmentKm2: 960,
+      mergedToCode: '',
+      reason: '临时断面撤销，编号停用',
+      occurredAt: '2024-05-01T00:00:00.000Z'
+    }
+  ]
+
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.codeEvents],
     async () => {
       const stamp = (row: { id: string }): { createdAt: number; updatedAt: number } => ({
         createdAt: now + row.id.length,
         updatedAt: now + row.id.length
       })
 
-      await db.stations.bulkPut(
-        stationBundles.map((bundle) => ({ ...bundle.station, ...stamp(bundle.station) }))
-      )
-      await db.sections.bulkPut(
-        stationBundles.flatMap((bundle) =>
+      await db.stations.bulkPut([
+        ...stationBundles.map((bundle) => ({ ...bundle.station, ...stamp(bundle.station) })),
+        { ...withdrawnStation, ...stamp(withdrawnStation) }
+      ])
+      await db.sections.bulkPut([
+        ...stationBundles.flatMap((bundle) =>
           bundle.sections.map((section) => ({ ...section, ...stamp(section) }))
-        )
-      )
+        ),
+        { ...withdrawnSection, ...stamp(withdrawnSection) },
+        ...legacyOrphanSections.map((orphan) => ({ ...orphan.section, ...stamp(orphan.section) }))
+      ])
       await db.verticals.bulkPut(
         stationBundles.flatMap((bundle) =>
           bundle.verticals.map((vertical) => ({ ...vertical, ...stamp(vertical) }))
@@ -314,6 +644,7 @@ export async function seedDemoData(): Promise<void> {
           bundle.points.map((point) => ({ ...point, ...stamp(point) }))
         )
       )
+      await db.codeEvents.bulkPut(codeEventSeeds.map((event) => ({ ...event, ...stamp(event) })))
       await db.ratings.bulkPut(ratingSeeds.map((rating) => ({ ...rating, ...stamp(rating) })))
 
       // 比测记录：按定线拟合出曲线流量后计算偏差与判定，保证与页面展示一致
@@ -375,7 +706,7 @@ export async function initDatabase(): Promise<void> {
 export async function clearAllTables(): Promise<void> {
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares, db.codeEvents],
     async () => {
       await Promise.all([
         db.stations.clear(),
@@ -383,7 +714,8 @@ export async function clearAllTables(): Promise<void> {
         db.verticals.clear(),
         db.points.clear(),
         db.ratings.clear(),
-        db.compares.clear()
+        db.compares.clear(),
+        db.codeEvents.clear()
       ])
     }
   )
@@ -397,15 +729,16 @@ export async function resetDatabase(): Promise<void> {
 
 /** 统计各表行数，供页脚概览与导出页展示 */
 export async function countAll(): Promise<Record<string, number>> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sections, verticals, points, ratings, compares, codeEvents] = await Promise.all([
     db.stations.count(),
     db.sections.count(),
     db.verticals.count(),
     db.points.count(),
     db.ratings.count(),
-    db.compares.count()
+    db.compares.count(),
+    db.codeEvents.count()
   ])
-  return { stations, sections, verticals, points, ratings, compares }
+  return { stations, sections, verticals, points, ratings, compares, codeEvents }
 }
 
 /** 写入结构版本号到 localStorage，便于导出页比对 */
