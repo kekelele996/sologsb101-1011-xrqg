@@ -13,7 +13,7 @@ import {
 } from '@/utils/db'
 
 /** 备份集合键名 */
-export const BACKUP_KEYS = ['stations', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
+export const BACKUP_KEYS = ['stations', 'sectionNumbers', 'sections', 'verticals', 'points', 'ratings', 'compares'] as const
 export type BackupKey = (typeof BACKUP_KEYS)[number]
 
 /** 各表行数统计（导出页展示与导入结果回执共用） */
@@ -21,8 +21,9 @@ export type CountMap = Record<BackupKey, number>
 
 /** 组装当前本地数据的完整快照 */
 export async function buildBackupPayload(): Promise<BackupPayload> {
-  const [stations, sections, verticals, points, ratings, compares] = await Promise.all([
+  const [stations, sectionNumbers, sections, verticals, points, ratings, compares] = await Promise.all([
     db.stations.toArray(),
+    db.sectionNumbers.toArray(),
     db.sections.toArray(),
     db.verticals.toArray(),
     db.points.toArray(),
@@ -34,6 +35,7 @@ export async function buildBackupPayload(): Promise<BackupPayload> {
     dbVersion: DB_VERSION,
     exportedAt: new Date().toISOString(),
     stations,
+    sectionNumbers,
     sections,
     verticals,
     points,
@@ -61,6 +63,7 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
     dbVersion: typeof obj.dbVersion === 'number' ? obj.dbVersion : DB_VERSION,
     exportedAt: typeof obj.exportedAt === 'string' ? obj.exportedAt : new Date().toISOString(),
     stations: obj.stations ?? [],
+    sectionNumbers: obj.sectionNumbers ?? [],
     sections: obj.sections ?? [],
     verticals: obj.verticals ?? [],
     points: obj.points ?? [],
@@ -74,6 +77,7 @@ export function validateBackup(input: unknown): { ok: boolean; errors: string[];
 export function countPayload(payload: BackupPayload): CountMap {
   return {
     stations: payload.stations.length,
+    sectionNumbers: payload.sectionNumbers.length,
     sections: payload.sections.length,
     verticals: payload.verticals.length,
     points: payload.points.length,
@@ -116,9 +120,10 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
   if (overwrite) await clearAllTables()
   await db.transaction(
     'rw',
-    [db.stations, db.sections, db.verticals, db.points, db.ratings, db.compares],
+    [db.stations, db.sectionNumbers, db.sections, db.verticals, db.points, db.ratings, db.compares],
     async () => {
       await db.stations.bulkPut(payload.stations)
+      await db.sectionNumbers.bulkPut(payload.sectionNumbers)
       await db.sections.bulkPut(payload.sections)
       await db.verticals.bulkPut(payload.verticals)
       await db.points.bulkPut(payload.points)
@@ -132,6 +137,7 @@ export async function importBackup(payload: BackupPayload, overwrite: boolean): 
 /** 追加式导入：为导入数据重新分配 id，避免覆盖现有档案 */
 export function remapIds(payload: BackupPayload): BackupPayload {
   const stationMap = new Map<string, string>()
+  const sectionNumberMap = new Map<string, string>()
   const sectionMap = new Map<string, string>()
   const verticalMap = new Map<string, string>()
   const ratingMap = new Map<string, string>()
@@ -141,10 +147,25 @@ export function remapIds(payload: BackupPayload): BackupPayload {
     stationMap.set(station.id, id)
     return { ...station, id }
   })
+  const sectionNumbers = payload.sectionNumbers.map((number) => {
+    const id = createId('sn')
+    sectionNumberMap.set(number.id, id)
+    return {
+      ...number,
+      id,
+      stationId: stationMap.get(number.stationId) ?? number.stationId,
+      mergedIntoId: number.mergedIntoId ? sectionNumberMap.get(number.mergedIntoId) ?? number.mergedIntoId : null
+    }
+  })
   const sections = payload.sections.map((section) => {
     const id = createId('sec')
     sectionMap.set(section.id, id)
-    return { ...section, id, stationId: stationMap.get(section.stationId) ?? section.stationId }
+    return {
+      ...section,
+      id,
+      stationId: stationMap.get(section.stationId) ?? section.stationId,
+      sectionNumberId: sectionNumberMap.get(section.sectionNumberId) ?? section.sectionNumberId
+    }
   })
   const verticals = payload.verticals.map((vertical) => {
     const id = createId('vrt')
@@ -159,14 +180,19 @@ export function remapIds(payload: BackupPayload): BackupPayload {
   const ratings = payload.ratings.map((rating) => {
     const id = createId('rat')
     ratingMap.set(rating.id, id)
-    return { ...rating, id, stationId: stationMap.get(rating.stationId) ?? rating.stationId }
+    return {
+      ...rating,
+      id,
+      stationId: stationMap.get(rating.stationId) ?? rating.stationId,
+      sectionNumberId: sectionNumberMap.get(rating.sectionNumberId) ?? rating.sectionNumberId
+    }
   })
   const compares = payload.compares.map((compare) => ({
     ...compare,
     id: createId('cmp'),
     ratingId: ratingMap.get(compare.ratingId) ?? compare.ratingId
   }))
-  return { ...payload, stations, sections, verticals, points, ratings, compares }
+  return { ...payload, stations, sectionNumbers, sections, verticals, points, ratings, compares }
 }
 
 /**

@@ -234,6 +234,15 @@ onMounted(() => {
         :title="`起点距排序校验未通过：垂线 ${conflicts.join('、')} 的起点距与其他垂线重复，请调整后再参与流量计算`"
       />
 
+      <el-alert
+        v-if="section.reconcileStatus === 'shelved' || section.reconcileStatus === 'unmatched'"
+        type="error"
+        show-icon
+        :closable="false"
+        title="该测次引用的断面编号已撤 / 并或未建档，断面流量暂停报出"
+        description="流量成果仍按垂线测点计算留底，但不参与关系点据定线与报出；请前往对账中心由站网科重新指派，或巡测队退回本侧重试。"
+      />
+
       <EmptyPanel
         v-if="verticalRows.length === 0"
         title="该测次还没有垂线"

@@ -3,6 +3,10 @@ export interface Rating {
   id: string
   /** 所属测站 */
   stationId: string
+  /** 报出时依据的断面编号（站网科台账 id）；编号撤 / 并后据此判定是否暂停报出 */
+  sectionNumberId: string
+  /** 报出时的编号快照（历史流量按当时编号可查） */
+  sectionCodeSnapshot: string
   /** 水位（m） */
   stageM: number
   /** 流量（m³/s） */

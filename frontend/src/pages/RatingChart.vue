@@ -354,6 +354,7 @@ onMounted(() => {
           <template #default="{ row }">
             <div>{{ row.stationName }}</div>
             <div class="gb-hint gb-mono">{{ row.rating.measureNo || '未标记测次' }}</div>
+            <el-tag v-if="!row.reportable" size="small" type="danger" effect="plain">暂停报出</el-tag>
           </template>
         </el-table-column>
         <el-table-column label="点据时间" width="170">

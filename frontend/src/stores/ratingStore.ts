@@ -10,11 +10,13 @@ import { DEVIATION_LIMIT_PCT, calcDeviationPct, judgeDeviation, type CompareRow 
 import type { Rating, RatingFitResult } from '@/types/rating'
 import { createEmptyRatingFilter, curveFlow, fitPowerCurve, type RatingFilterState } from '@/types/rating'
 import type { Station } from '@/types/station'
+import type { SectionNumber } from '@/types/sectionNumber'
 
 export const useRatingStore = defineStore('rating', () => {
   const ratings = ref<Rating[]>([])
   const compares = ref<Compare[]>([])
   const stations = ref<Station[]>([])
+  const sectionNumbers = ref<SectionNumber[]>([])
   const ready = ref(false)
   const error = ref<string | null>(null)
   const filter = ref<RatingFilterState>(createEmptyRatingFilter())
@@ -39,7 +41,24 @@ export const useRatingStore = defineStore('rating', () => {
     watchTable<Station>(() => db.stations).subscribe((rows) => {
       stations.value = rows
     })
+    watchTable<SectionNumber>(() => db.sectionNumbers).subscribe((rows) => {
+      sectionNumbers.value = rows
+    })
   }
+
+  /** 编号 id → 是否在用（流量报出门：编号撤 / 并则该点据暂停报出） */
+  const activeNumberIds = computed<Set<string>>(
+    () => new Set(sectionNumbers.value.filter((number) => number.status === 'active').map((number) => number.id))
+  )
+
+  /** 点据是否可报出：编号在用（含改派）或未挂编号；编号已撤 / 并则暂停报出 */
+  function isRatingReportable(rating: Rating): boolean {
+    if (!rating.sectionNumberId) return true
+    return activeNumberIds.value.has(rating.sectionNumberId)
+  }
+
+  /** 可报出的点据（参与定线拟合；悬空编号下的点据暂停报出） */
+  const reportableRatings = computed<Rating[]>(() => ratings.value.filter(isRatingReportable))
 
   const lineNos = computed<string[]>(() => {
     const set = new Set<string>()
@@ -50,10 +69,10 @@ export const useRatingStore = defineStore('rating', () => {
   const stationNameOf = (stationId: string): string =>
     stations.value.find((station) => station.id === stationId)?.name ?? '未知测站'
 
-  /** 逐定线号的拟合结果（幂函数定线） */
+  /** 逐定线号的拟合结果（幂函数定线）；仅纳入可报出的点据，悬空编号下的流量先不报 */
   const allFits = computed<RatingFitResult[]>(() =>
     lineNos.value.map((lineNo) => {
-      const points = ratings.value
+      const points = reportableRatings.value
         .filter((rating) => rating.lineNo === lineNo)
         .map((rating) => ({ stageM: rating.stageM, flowM3s: rating.flowM3s }))
       return fitPowerCurve(points, lineNo)
@@ -68,7 +87,7 @@ export const useRatingStore = defineStore('rating', () => {
     return fitPowerCurve([], activeLineNo.value)
   })
 
-  /** 点据 + 曲线流量 + 残差 */
+  /** 点据 + 曲线流量 + 残差（含是否暂停报出标记） */
   const pointRows = computed(() =>
     ratings.value
       .filter((rating) => rating.lineNo === activeLineNo.value)
@@ -79,7 +98,7 @@ export const useRatingStore = defineStore('rating', () => {
           activeFit.value.valid && rating.flowM3s > 0
             ? Number((((rating.flowM3s - predicted) / rating.flowM3s) * 100).toFixed(2))
             : 0
-        return { rating, predicted, residualPct }
+        return { rating, predicted, residualPct, reportable: isRatingReportable(rating) }
       })
   )
 
@@ -167,10 +186,34 @@ export const useRatingStore = defineStore('rating', () => {
   }
 
   async function createRating(
-    payload: Omit<Rating, 'id' | 'createdAt' | 'updatedAt'>
+    payload: Omit<Rating, 'id' | 'createdAt' | 'updatedAt' | 'sectionNumberId' | 'sectionCodeSnapshot'> & {
+      sectionNumberId?: string
+      sectionCodeSnapshot?: string
+    }
   ): Promise<Rating> {
     const now = Date.now()
-    const row: Rating = { ...payload, id: createId('rat'), createdAt: now, updatedAt: now }
+    // 点据报出：优先用表单指定编号，否则取该测站台账第一条在用编号
+    let sectionNumberId = payload.sectionNumberId ?? ''
+    let sectionCodeSnapshot = payload.sectionCodeSnapshot ?? ''
+    if (!sectionNumberId) {
+      const primary = await db.sectionNumbers
+        .where('stationId')
+        .equals(payload.stationId)
+        .filter((number) => number.status === 'active')
+        .first()
+      if (primary) {
+        sectionNumberId = primary.id
+        sectionCodeSnapshot = primary.code
+      }
+    }
+    const row: Rating = {
+      ...payload,
+      sectionNumberId,
+      sectionCodeSnapshot,
+      id: createId('rat'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.ratings.put(row)
     return row
   }
@@ -257,6 +300,7 @@ export const useRatingStore = defineStore('rating', () => {
     ratings,
     compares,
     stations,
+    sectionNumbers,
     ready,
     error,
     filter,
@@ -265,6 +309,9 @@ export const useRatingStore = defineStore('rating', () => {
     fits,
     deviationLimitPct,
     lineNos,
+    activeNumberIds,
+    isRatingReportable,
+    reportableRatings,
     allFits,
     pointRows,
     filteredRatings,

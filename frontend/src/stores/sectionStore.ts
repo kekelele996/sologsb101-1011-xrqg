@@ -179,10 +179,36 @@ export const useSectionStore = defineStore('section', () => {
   /* ------------------------------ 断面测次 ------------------------------ */
 
   async function createSection(
-    payload: Omit<Section, 'id' | 'createdAt' | 'updatedAt'>
+    payload: Omit<Section, 'id' | 'createdAt' | 'updatedAt' | 'sectionNumberId' | 'sectionCodeSnapshot' | 'reconcileStatus'> & {
+      sectionNumberId?: string
+      sectionCodeSnapshot?: string
+      reconcileStatus?: Section['reconcileStatus']
+    }
   ): Promise<Section> {
     const now = Date.now()
-    const row: Section = { ...payload, id: createId('sec'), createdAt: now, updatedAt: now }
+    // 测次落编：优先用表单指定的断面编号，否则取该测站台账中第一条在用编号
+    let sectionNumberId = payload.sectionNumberId ?? ''
+    let sectionCodeSnapshot = payload.sectionCodeSnapshot ?? ''
+    if (!sectionNumberId) {
+      const primary = await db.sectionNumbers
+        .where('stationId')
+        .equals(payload.stationId)
+        .filter((number) => number.status === 'active')
+        .first()
+      if (primary) {
+        sectionNumberId = primary.id
+        sectionCodeSnapshot = primary.code
+      }
+    }
+    const row: Section = {
+      ...payload,
+      sectionNumberId,
+      sectionCodeSnapshot,
+      reconcileStatus: payload.reconcileStatus ?? (sectionNumberId ? 'matched' : 'unmatched'),
+      id: createId('sec'),
+      createdAt: now,
+      updatedAt: now
+    }
     await db.sections.put(row)
     return row
   }

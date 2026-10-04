@@ -290,7 +290,7 @@ onMounted(() => {
       <div class="gb-panel-title">
         <h3>全量 JSON 导入导出</h3>
         <span class="gb-hint">
-          导出内容包含 stations / sections / verticals / points / ratings / compares 六张表
+          导出内容包含 stations / sectionNumbers / sections / verticals / points / ratings / compares 七张表
         </span>
       </div>
 
@@ -325,6 +325,9 @@ onMounted(() => {
       <el-descriptions :column="3" border size="small">
         <el-descriptions-item label="本地库名">{{ DB_NAME }}</el-descriptions-item>
         <el-descriptions-item label="结构版本">v{{ DB_VERSION }}</el-descriptions-item>
+        <el-descriptions-item label="测站 / 断面编号">
+          {{ counts.stations ?? 0 }} / {{ counts.sectionNumbers ?? 0 }}
+        </el-descriptions-item>
         <el-descriptions-item label="测站 / 测次">
           {{ counts.stations ?? 0 }} / {{ counts.sections ?? 0 }}
         </el-descriptions-item>
@@ -334,7 +337,7 @@ onMounted(() => {
         <el-descriptions-item label="点据 / 比测">
           {{ counts.ratings ?? 0 }} / {{ counts.compares ?? 0 }}
         </el-descriptions-item>
-        <el-descriptions-item label="最近备份时间">
+        <el-descriptions-item label="最近备份时间" :span="3">
           {{ lastBackupAt ? new Date(lastBackupAt).toLocaleString('zh-CN') : '尚未备份' }}
         </el-descriptions-item>
       </el-descriptions>

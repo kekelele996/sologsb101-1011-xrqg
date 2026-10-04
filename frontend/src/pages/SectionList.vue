@@ -14,13 +14,16 @@ import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import RouteMissingPanel from '@/components/common/RouteMissingPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
+import { useSectionNumberStore } from '@/stores/sectionNumberStore'
 import { MEASURE_METHODS, type MeasureMethod, type Section } from '@/types/section'
+import { RECONCILE_STATUS_META, type ReconcileStatus } from '@/types/sectionNumber'
 import { initDatabase } from '@/utils/db'
 
 const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
+const numberStore = useSectionNumberStore()
 
 const stationId = computed(() => String(route.params.id ?? ''))
 const station = computed(() => stationStore.stationById(stationId.value))
@@ -72,6 +75,17 @@ const stats = computed(() => {
     currentStageM: list.length ? list[0].stageM : null
   }
 })
+
+/** 本站测次的对账状态汇总（悬空 / 待认领 → 流量暂停报出） */
+const reconcileStats = computed(() => {
+  const list = sectionStore.sectionsOfStation(stationId.value)
+  return {
+    shelved: list.filter((section) => section.reconcileStatus === 'shelved').length,
+    unmatched: list.filter((section) => section.reconcileStatus === 'unmatched').length
+  }
+})
+
+const reconcileMeta = (status: ReconcileStatus) => RECONCILE_STATUS_META[status]
 
 function openCreate(): void {
   editingId.value = null
@@ -176,6 +190,7 @@ function reseedIfEmpty(): void {
 
 onMounted(() => {
   reseedIfEmpty()
+  numberStore.start()
   const query = route.query
   sectionStore.patchFilter({
     keyword: typeof query.kw === 'string' ? query.kw : '',
@@ -262,6 +277,19 @@ onMounted(() => {
         </template>
       </FilterBar>
 
+      <el-alert
+        v-if="reconcileStats.shelved > 0 || reconcileStats.unmatched > 0"
+        type="warning"
+        show-icon
+        :closable="false"
+        class="page__reconcile-alert"
+        :title="`本站有 ${reconcileStats.shelved} 条悬空测次（编号已撤 / 并）、${reconcileStats.unmatched} 条待认领测次，流量暂停报出，请前往对账中心重新指派`"
+      >
+        <div class="page__reconcile-actions">
+          <el-button size="small" type="warning" @click="router.push('/reconcile')">前往对账中心</el-button>
+        </div>
+      </el-alert>
+
       <EmptyPanel
         v-if="sectionRows.length === 0"
         :title="sectionStore.sectionsOfStation(stationId).length === 0 ? '该测站还没有测次' : '没有符合条件的测次'"
@@ -279,6 +307,19 @@ onMounted(() => {
             <el-tag size="small" :type="row.method === 'ADCP' ? 'success' : row.method === '浮标' ? 'warning' : 'primary'" effect="plain">
               {{ row.method }}
             </el-tag>
+          </template>
+        </el-table-column>
+        <el-table-column label="对账状态" width="120">
+          <template #default="{ row }">
+            <el-tag
+              v-if="row.reconcileStatus"
+              size="small"
+              :type="reconcileMeta(row.reconcileStatus).tagType"
+              effect="plain"
+            >
+              {{ reconcileMeta(row.reconcileStatus).label }}
+            </el-tag>
+            <span v-else class="gb-hint">—</span>
           </template>
         </el-table-column>
         <el-table-column label="水位 (m)" width="110" align="right">
@@ -386,5 +427,13 @@ onMounted(() => {
   margin-left: 8px;
   font-size: 12px;
   color: #8194a2;
+}
+
+.page__reconcile-alert {
+  margin: 0;
+}
+
+.page__reconcile-actions {
+  margin-top: 8px;
 }
 </style>

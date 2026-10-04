@@ -13,6 +13,7 @@ import StatBadge from '@/components/common/StatBadge.vue'
 import EmptyPanel from '@/components/common/EmptyPanel.vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useRatingStore } from '@/stores/ratingStore'
+import { useSectionNumberStore } from '@/stores/sectionNumberStore'
 import { CATCHMENT_BUCKETS, createEmptyStationFilter, type Station } from '@/types/station'
 import { initDatabase } from '@/utils/db'
 
@@ -20,6 +21,7 @@ const route = useRoute()
 const router = useRouter()
 const stationStore = useStationStore()
 const ratingStore = useRatingStore()
+const numberStore = useSectionNumberStore()
 
 const dialogVisible = ref(false)
 const editingId = ref<string | null>(null)
@@ -45,6 +47,13 @@ const riverSelectOptions = computed(() =>
 
 /** 集水面积分档下拉：切换即写入上下限 */
 const catchmentBucket = ref<string>('all')
+
+/** 某测站在用断面编号条数（台账主数据） */
+function activeNumberCountOf(stationId: string): number {
+  return numberStore.sectionNumbers.filter(
+    (number) => number.stationId === stationId && number.status === 'active'
+  ).length
+}
 
 const stationCards = computed(() =>
   stationStore.filteredStations.map((station) => {
@@ -183,6 +192,7 @@ async function reseed(): Promise<void> {
 
 onMounted(() => {
   applyQueryToFilter()
+  numberStore.start()
   if (stationStore.stations.length === 0) void reseed()
 })
 
@@ -304,6 +314,7 @@ watch(
         <div class="station-card__meta">
           <span>集水面积 <b class="gb-mono">{{ card.station.catchmentKm2 }}</b> km²</span>
           <span>关系点据 <b class="gb-mono">{{ card.ratingCount }}</b> 个</span>
+          <span>在用编号 <b class="gb-mono">{{ activeNumberCountOf(card.station.id) }}</b> 条</span>
           <span v-if="card.overLimit > 0" class="station-card__alert">
             <el-icon><Warning /></el-icon> 超限 <b class="gb-mono">{{ card.overLimit }}</b> 条
           </span>

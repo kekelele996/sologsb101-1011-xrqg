@@ -5,10 +5,11 @@
  */
 import { computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { DataLine, Files, Histogram, Odometer, PieChart, TrendCharts } from '@element-plus/icons-vue'
+import { DataLine, Files, Histogram, Link, Odometer, PieChart, Sort, TrendCharts } from '@element-plus/icons-vue'
 import { useStationStore } from '@/stores/stationStore'
 import { useSectionStore } from '@/stores/sectionStore'
 import { useRatingStore } from '@/stores/ratingStore'
+import { useSectionNumberStore } from '@/stores/sectionNumberStore'
 import { DB_NAME, DB_VERSION } from '@/utils/db'
 
 const route = useRoute()
@@ -16,11 +17,13 @@ const router = useRouter()
 const stationStore = useStationStore()
 const sectionStore = useSectionStore()
 const ratingStore = useRatingStore()
+const numberStore = useSectionNumberStore()
 
 onMounted(() => {
   stationStore.start()
   sectionStore.start()
   ratingStore.start()
+  numberStore.start()
 })
 
 /** 层级路由统一归属到最上层导航项 */
@@ -33,6 +36,13 @@ const activeKey = computed(() => {
 
 const navItems = computed(() => [
   { key: '/stations', label: '测站台账', icon: Odometer, badge: String(stationStore.stations.length) },
+  { key: '/section-numbers', label: '断面编号台账', icon: Link, badge: String(numberStore.sectionNumbers.length) },
+  {
+    key: '/reconcile',
+    label: '对账中心',
+    icon: Sort,
+    badge: String(numberStore.stats.shelved + numberStore.stats.unmatched)
+  },
   { key: '/ratings', label: '关系点据与定线', icon: TrendCharts, badge: String(ratingStore.ratings.length) },
   { key: '/export', label: '比测与导出', icon: PieChart, badge: String(ratingStore.overLimitRows.length) }
 ])

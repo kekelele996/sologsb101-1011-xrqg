@@ -2,8 +2,8 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from 'vue-router'
 
 /**
  * 路由表：路径与提示词逐字一致。
- * /stations、/stations/:id/sections、/sections/:id/verticals、/verticals/:id/points、/ratings、/export
- * 全部页面懒加载，构建时自动分包。
+ * /stations、/stations/:id/sections、/sections/:id/verticals、/verticals/:id/points、/ratings、/export、
+ * /section-numbers、/reconcile 全部页面懒加载，构建时自动分包。
  */
 const routes: RouteRecordRaw[] = [
   { path: '/', redirect: '/stations' },
@@ -36,6 +36,18 @@ const routes: RouteRecordRaw[] = [
     name: 'rating-chart',
     component: () => import('@/pages/RatingChart.vue'),
     meta: { title: '水位流量关系点据', icon: 'TrendCharts' }
+  },
+  {
+    path: '/section-numbers',
+    name: 'section-number-list',
+    component: () => import('@/pages/SectionNumberList.vue'),
+    meta: { title: '断面编号台账', icon: 'Link' }
+  },
+  {
+    path: '/reconcile',
+    name: 'reconcile-board',
+    component: () => import('@/pages/ReconcileBoard.vue'),
+    meta: { title: '对账中心', icon: 'Sort' }
   },
   {
     path: '/export',
